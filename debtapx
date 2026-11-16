@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+# debtapx — debtap extended: install .deb apps on Arch with profiles + fixes.
+#
+# Usage:
+#   debtapx [options] [app|package.deb]
+#   debtapx                          # interactive: list matching debs in --dir
+#   debtapx grok-bot                 # latest matching deb for known app
+#   debtapx bitwig
+#   debtapx lm-studio [--force]      # extract installer (not debtap)
+#   debtapx /path/to/foo.deb         # generalist debtap path
+#
+# Options:
+#   --dir DIR         Search/work directory (default: ~/Downloads)
+#   --force           Reinstall even if version matches (lm-studio)
+#   --no-update       Skip `sudo debtap -u`
+#   --convert-only    Convert with debtap but do not pacman -U
+#   --keep-pkg        Keep the generated .pkg.tar.* (default: keep)
+#   --clean-pkg       Remove generated .pkg.tar.* after successful install
+#   -V, --version     Print version
+#   -h, --help        Show help
+set -euo pipefail
+
+DEBTAPX_VERSION="0.1.0"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
+  DEBTAPX_VERSION="$(tr -d '[:space:]' <"$SCRIPT_DIR/VERSION")"
+fi
+
+DOWNLOADS="${HOME}/Downloads"
+WORK_DIR="$DOWNLOADS"
+FORCE=false
+UPDATE_DEBTAP=true
+CONVERT_ONLY=false
+CLEAN_PKG=false
+TARGET=""
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "warning: $*" >&2; }
+
+usage() {
+  cat <<EOF
+debtapx $DEBTAPX_VERSION — install .deb apps on Arch (debtap + profiles).
+
+Usage:
+  debtapx [options] [app|package.deb]
+  debtapx                          # interactive: list debs in --dir
+  debtapx grok-bot                 # latest matching deb for known app
+  debtapx bitwig
+  debtapx lm-studio [--force]      # extract installer (not debtap)
+  debtapx /path/to/foo.deb         # generalist debtap path
+
+Options:
+  --dir DIR         Search/work directory (default: ~/Downloads)
+  --force           Reinstall even if version matches (lm-studio)
+  --no-update       Skip \`sudo debtap -u\`
+  --convert-only    Convert with debtap but do not pacman -U
+  --keep-pkg        Keep the generated .pkg.tar.* (default: keep)
+  --clean-pkg       Remove generated .pkg.tar.* after successful install
+  -V, --version     Print version
+  -h, --help        Show help
+EOF
+  echo
+  echo "Known apps:"
+  for name in "${!APP_GLOBS[@]}"; do
+    printf "  %-22s  method=%-16s  glob=%s\n" \
+      "$name" "${APP_METHODS[$name]}" "${APP_GLOBS[$name]}"
+  done | sort
+}
+
+# ---------------------------------------------------------------------------
+# App profiles: glob (in WORK_DIR), install method, optional pacman pkg name,
+# optional binary to verify after install.
+# ---------------------------------------------------------------------------
+declare -A APP_GLOBS=(
+  [grok-bot]="grok-bot_*.deb"
+  [grok]="grok-bot_*.deb"
+  [bitwig]="bitwig-studio*.deb"
+  [bitwig-studio]="bitwig-studio*.deb"
+  [lm-studio]="LM-Studio-*.deb"
+  [lmstudio]="LM-Studio-*.deb"
+  [opencode]="opencode*.deb"
+  [autenticacao-gov]="plugin-autenticacao-gov*.deb"
+  [plugin-autenticacao-gov]="plugin-autenticacao-gov*.deb"
+)
+
+declare -A APP_METHODS=(
+  [grok-bot]="debtap"
+  [grok]="debtap"
+  [bitwig]="debtap"
+  [bitwig-studio]="debtap"
+  [lm-studio]="extract-lm-studio"
+  [lmstudio]="extract-lm-studio"
+  [opencode]="debtap"
+  [autenticacao-gov]="debtap"
+  [plugin-autenticacao-gov]="debtap"
+)
+
+declare -A APP_PKGNAMES=(
+  [grok-bot]="grok-bot"
+  [grok]="grok-bot"
+  [bitwig]="bitwig-studio"
+  [bitwig-studio]="bitwig-studio"
+  [lm-studio]="lm-studio"
+  [lmstudio]="lm-studio"
+  [opencode]="opencode-desktop"
+  [autenticacao-gov]="plugin-autenticacao-gov"
+  [plugin-autenticacao-gov]="plugin-autenticacao-gov"
+)
+
+declare -A APP_BINS=(
+  [grok-bot]="grok-bot"
+  [grok]="grok-bot"
+  [bitwig]="bitwig-studio"
+  [bitwig-studio]="bitwig-studio"
+  [lm-studio]="lm-studio"
+  [lmstudio]="lm-studio"
+)
+
+# ---------------------------------------------------------------------------
+# Arg parse
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "debtapx $DEBTAPX_VERSION"; exit 0 ;;
+    --dir) WORK_DIR="${2:?--dir requires a path}"; shift 2 ;;
+    --force) FORCE=true; shift ;;
+    --no-update) UPDATE_DEBTAP=false; shift ;;
+    --convert-only) CONVERT_ONLY=true; shift ;;
+    --keep-pkg) CLEAN_PKG=false; shift ;;
+    --clean-pkg) CLEAN_PKG=true; shift ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) TARGET="$1"; shift; break ;;
+  esac
+done
+# Allow leftover args only for lm-studio --force style after target
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE=true; shift ;;
+    *) die "unexpected argument: $1" ;;
+  esac
+done
+
+WORK_DIR="$(cd -- "$WORK_DIR" && pwd)"
+mkdir -p "$WORK_DIR"
+
+require_cmds() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"
+  done
+}
+
+newest_file() {
+  # stdin: list of paths → stdout: newest by mtime
+  local f newest="" newest_mtime=0 mtime
+  while IFS= read -r f; do
+    [[ -z "$f" || ! -f "$f" ]] && continue
+    mtime=$(stat -c %Y "$f")
+    if ((mtime >= newest_mtime)); then
+      newest_mtime=$mtime
+      newest=$f
+    fi
+  done
+  [[ -n "$newest" ]] || return 1
+  printf '%s\n' "$newest"
+}
+
+find_debs_by_glob() {
+  local glob="$1"
+  local path
+  shopt -s nullglob
+  for path in "$WORK_DIR"/$glob; do
+    printf '%s\n' "$path"
+  done
+  shopt -u nullglob
+}
+
+resolve_app_deb() {
+  local app="$1"
+  local glob="${APP_GLOBS[$app]:-}"
+  [[ -n "$glob" ]] || die "unknown app: $app"
+  local matches
+  matches="$(find_debs_by_glob "$glob" || true)"
+  [[ -n "$matches" ]] || die "no deb matching '$glob' in $WORK_DIR"
+  newest_file <<<"$matches"
+}
+
+detect_app_from_deb() {
+  local base
+  base="$(basename "$1")"
+  case "$base" in
+    grok-bot_*.deb|grok-bot-*.deb) echo grok-bot ;;
+    bitwig-studio*.deb|bitwig*.deb) echo bitwig-studio ;;
+    LM-Studio-*.deb|lm-studio*.deb) echo lm-studio ;;
+    opencode*.deb) echo opencode ;;
+    plugin-autenticacao-gov*.deb) echo plugin-autenticacao-gov ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# debtap helpers (from Bitwig install.sh)
+# ---------------------------------------------------------------------------
+ensure_debtap_ready() {
+  require_cmds debtap pacman sudo
+
+  if $UPDATE_DEBTAP; then
+    info "Updating debtap database (sudo)..."
+    sudo debtap -u
+  else
+    info "Skipping debtap database update (--no-update)"
+  fi
+
+  # debtap checks for numbered pkgfile DBs; modern pkgfile only has *.files
+  if [[ -d /var/cache/pkgfile ]] && ! compgen -G '/var/cache/pkgfile/*.files.[0-9][0-9][0-9]' >/dev/null; then
+    info "Adding pkgfile compatibility marker for debtap..."
+    sudo touch /var/cache/pkgfile/extra.files.000
+  fi
+}
+
+# debtap sometimes emits Debian-ish deps that don't exist on Arch (e.g. bare "gtk").
+sanitize_arch_pkg() {
+  local pkg="$1"
+  local work fixed out
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$work'" RETURN
+
+  bsdtar -C "$work" -xf "$pkg"
+  [[ -f "$work/.PKGINFO" ]] || die "no .PKGINFO in $pkg"
+
+  # Drop known-bad depends; keep gtk3/gtk4 etc.
+  grep -Ev '^depend = (gtk|libgtk-3-0|libgtk2\.0-0|gconf2|gconf)$' \
+    "$work/.PKGINFO" >"$work/.PKGINFO.fixed"
+  if ! cmp -s "$work/.PKGINFO" "$work/.PKGINFO.fixed"; then
+    info "Sanitizing Arch package metadata (removed non-Arch depends)"
+    mv "$work/.PKGINFO.fixed" "$work/.PKGINFO"
+    # Invalidate bundled .MTREE so pacman regenerates integrity from contents
+    rm -f "$work/.MTREE"
+    out="${pkg%.pkg.tar.*}.sanitized.pkg.tar.zst"
+    (
+      cd "$work"
+      # shellcheck disable=SC2035
+      bsdtar --uid 0 --gid 0 -c -f - .PKGINFO $( [[ -f .INSTALL ]] && echo .INSTALL ) * \
+        | zstd -T0 -10 -q -o "$out"
+    )
+    mv -f "$out" "$pkg"
+  else
+    rm -f "$work/.PKGINFO.fixed"
+  fi
+}
+
+debtap_convert_and_install() {
+  local deb="$1"
+  local pkgname_hint="${2:-}"
+  local bin_hint="${3:-}"
+  local deb_abs deb_dir before after pkgs newest
+
+  deb_abs="$(cd -- "$(dirname -- "$deb")" && pwd)/$(basename -- "$deb")"
+  [[ -f "$deb_abs" ]] || die "deb not found: $deb"
+  deb_dir="$(dirname -- "$deb_abs")"
+
+  ensure_debtap_ready
+
+  # Snapshot existing packages so we can find the new one reliably
+  before="$(mktemp)"
+  after="$(mktemp)"
+  trap 'rm -f "$before" "$after"' RETURN
+  find "$deb_dir" -maxdepth 1 -type f \( \
+      -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' -o -name '*.pkg.tar.gz' \
+    \) -printf '%f\n' | sort >"$before"
+
+  info "Converting with debtap: $deb_abs"
+  (
+    cd "$deb_dir"
+    debtap -Q -o "$deb_dir" "$deb_abs"
+  )
+
+  find "$deb_dir" -maxdepth 1 -type f \( \
+      -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' -o -name '*.pkg.tar.gz' \
+    \) -printf '%f\n' | sort >"$after"
+
+  mapfile -t pkgs < <(comm -13 "$before" "$after")
+  if ((${#pkgs[@]} == 0)); then
+    # Fallback: newest package in dir (e.g. overwrite of same filename)
+    newest="$(
+      find "$deb_dir" -maxdepth 1 -type f \( \
+        -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' -o -name '*.pkg.tar.gz' \
+      \) -print | newest_file
+    )" || die "debtap finished but no .pkg.tar.* was created in $deb_dir"
+  else
+    newest="$(
+      for b in "${pkgs[@]}"; do
+        printf '%s\n' "$deb_dir/$b"
+      done | newest_file
+    )" || die "could not resolve generated package"
+  fi
+
+  info "Created: $newest"
+  sanitize_arch_pkg "$newest"
+
+  if $CONVERT_ONLY; then
+    info "Convert-only; skipping install."
+    return 0
+  fi
+
+  info "Installing with pacman: $newest"
+  sudo pacman -U --noconfirm --needed "$newest"
+
+  # App-specific post-install fixes (debtap/.INSTALL gaps on Arch)
+  case "$pkgname_hint" in
+    grok-bot)
+      # Debian update-alternatives often fails on the space in "/opt/Grok Bot".
+      if [[ ! -e /usr/bin/grok-bot ]]; then
+        info "Creating /usr/bin/grok-bot launcher symlink"
+        sudo ln -sfn '/opt/Grok Bot/grok-bot' /usr/bin/grok-bot
+      fi
+      ;;
+  esac
+
+  if $CLEAN_PKG; then
+    info "Removing generated package (--clean-pkg): $newest"
+    rm -f "$newest"
+  fi
+
+  if [[ -n "$pkgname_hint" ]]; then
+    pacman -Q "$pkgname_hint" 2>/dev/null || true
+  fi
+  if [[ -n "$bin_hint" ]]; then
+    command -v "$bin_hint" || true
+  fi
+
+  info "Done."
+}
+
+# ---------------------------------------------------------------------------
+# LM Studio exception: extract .deb into /opt (existing install-lm-studio-deb.sh)
+# Prefer local deb in WORK_DIR; with --force or no local, optionally download.
+# ---------------------------------------------------------------------------
+install_lm_studio_extract() {
+  local deb="${1:-}"
+  local DOWNLOAD_URL="https://lmstudio.ai/download/latest/linux/x64?format=deb"
+  local INSTALL_DIR="/opt/lm-studio"
+  local APP_DIR="$INSTALL_DIR/LM-Studio"
+  local LAUNCHER="/usr/local/bin/lm-studio"
+  local VERSION_FILE="$INSTALL_DIR/.version"
+  local ICON_DEST="/usr/share/pixmaps/lm-studio.png"
+  local ICON_URL="https://lmstudio.ai/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Flogo-192x192.944df324.png&w=384&q=75"
+  local NEW_VERSION REMOTE_FILENAME INSTALLED_VERSION WORK DATA_ARCHIVE tmp_deb=false
+
+  require_cmds bsdtar curl sudo
+
+  if [[ -z "$deb" ]]; then
+    local matches
+    matches="$(find_debs_by_glob 'LM-Studio-*.deb' || true)"
+    if [[ -n "$matches" ]]; then
+      deb="$(newest_file <<<"$matches")"
+      info "Using local deb: $deb"
+    else
+      info "No local LM-Studio deb; downloading latest..."
+      REMOTE_FILENAME="$(curl -fsSL --head -w '%{url_effective}' -o /dev/null "$DOWNLOAD_URL" | sed 's|.*/||')"
+      [[ -n "$REMOTE_FILENAME" ]] || die "could not resolve latest LM Studio download URL"
+      deb="$(mktemp --suffix=.deb)"
+      tmp_deb=true
+      curl -fL --progress-bar "$DOWNLOAD_URL" -o "$deb" || die "download failed"
+    fi
+  fi
+
+  [[ -f "$deb" ]] || die "deb not found: $deb"
+
+  NEW_VERSION="$(basename "$deb" | sed -E 's/LM-Studio-([0-9.]+).*/\1/')"
+  [[ -n "$NEW_VERSION" ]] || die "could not parse version from: $deb"
+
+  INSTALLED_VERSION="none"
+  [[ -f "$VERSION_FILE" ]] && INSTALLED_VERSION="$(cat "$VERSION_FILE")"
+
+  if [[ "$NEW_VERSION" == "$INSTALLED_VERSION" ]] && ! $FORCE; then
+    info "Latest version already installed ($NEW_VERSION). Pass --force to reinstall."
+    $tmp_deb && rm -f "$deb"
+    return 0
+  fi
+
+  $FORCE && info "Force reinstall of $NEW_VERSION"
+
+  WORK="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$WORK'; $tmp_deb && rm -f '$deb'" RETURN
+
+  info "Extracting LM Studio $NEW_VERSION"
+  bsdtar -xf "$deb" -C "$WORK"
+  DATA_ARCHIVE="$(find "$WORK" -name 'data.tar.*' | head -1)"
+  [[ -n "$DATA_ARCHIVE" ]] || die "data.tar not found inside deb"
+  mkdir "$WORK/data"
+  bsdtar -xf "$DATA_ARCHIVE" -C "$WORK/data"
+
+  info "Installing to $INSTALL_DIR"
+  sudo rm -rf "$INSTALL_DIR"
+  sudo mkdir -p "$INSTALL_DIR"
+  sudo cp -r "$WORK/data/opt/"* "$INSTALL_DIR"
+  sudo chmod 4755 "$APP_DIR/chrome-sandbox" || true
+
+  if [[ -d "$WORK/data/usr/share/icons" ]]; then
+    info "Installing icons"
+    sudo cp -r "$WORK/data/usr/share/icons/"* /usr/share/icons/
+  fi
+
+  info "Installing icon"
+  if curl -fsSL "$ICON_URL" -o /tmp/lm-studio-icon.png 2>/dev/null; then
+    sudo mv /tmp/lm-studio-icon.png "$ICON_DEST"
+  elif [[ -f "$APP_DIR/resources/app/.webpack/main/assets/icon.png" ]]; then
+    warn "icon download failed; using bundled icon"
+    sudo cp "$APP_DIR/resources/app/.webpack/main/assets/icon.png" "$ICON_DEST"
+  else
+    warn "no icon source found"
+  fi
+
+  info "Creating launcher $LAUNCHER"
+  sudo tee "$LAUNCHER" >/dev/null <<EOF
+#!/usr/bin/env bash
+exec "$APP_DIR/lm-studio" "\$@"
+EOF
+  sudo chmod +x "$LAUNCHER"
+
+  info "Creating desktop entry"
+  sudo tee /usr/share/applications/lm-studio.desktop >/dev/null <<EOF
+[Desktop Entry]
+Name=LM Studio $NEW_VERSION
+Exec=$LAUNCHER
+Icon=$ICON_DEST
+Type=Application
+Categories=Development;AI;
+StartupWMClass=LM Studio
+EOF
+
+  echo "$NEW_VERSION" | sudo tee "$VERSION_FILE" >/dev/null
+  update-desktop-database >/dev/null 2>&1 || true
+
+  info "LM Studio $NEW_VERSION installed. Run: lm-studio"
+}
+
+# ---------------------------------------------------------------------------
+# Resolve target → install
+# ---------------------------------------------------------------------------
+interactive_pick() {
+  shopt -s nullglob
+  local debs=("$WORK_DIR"/*.deb)
+  shopt -u nullglob
+  ((${#debs[@]} > 0)) || die "no .deb files in $WORK_DIR"
+  echo "Deb packages in $WORK_DIR:" >&2
+  local i=1
+  for d in "${debs[@]}"; do
+    printf "  %2d) %s\n" "$i" "$(basename "$d")" >&2
+    ((i++)) || true
+  done
+  local choice
+  read -r -p "Select number (or q): " choice
+  [[ "$choice" == q || "$choice" == Q ]] && exit 0
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "invalid selection"
+  ((choice >= 1 && choice <= ${#debs[@]})) || die "out of range"
+  printf '%s\n' "${debs[choice-1]}"
+}
+
+main() {
+  local app="" method="debtap" deb="" pkgname="" bin=""
+
+  if [[ -z "$TARGET" ]]; then
+    deb="$(interactive_pick)"
+    app="$(detect_app_from_deb "$deb")"
+  elif [[ -f "$TARGET" ]]; then
+    deb="$(cd -- "$(dirname -- "$TARGET")" && pwd)/$(basename -- "$TARGET")"
+    app="$(detect_app_from_deb "$deb")"
+  elif [[ -f "$WORK_DIR/$TARGET" ]]; then
+    deb="$WORK_DIR/$TARGET"
+    app="$(detect_app_from_deb "$deb")"
+  elif [[ -n "${APP_GLOBS[$TARGET]+x}" ]]; then
+    app="$TARGET"
+    method="${APP_METHODS[$app]}"
+    if [[ "$method" == "extract-lm-studio" ]]; then
+      install_lm_studio_extract ""
+      return 0
+    fi
+    deb="$(resolve_app_deb "$app")"
+  else
+    die "not a file or known app: $TARGET (try --help)"
+  fi
+
+  if [[ -n "$app" ]]; then
+    method="${APP_METHODS[$app]:-debtap}"
+    pkgname="${APP_PKGNAMES[$app]:-}"
+    bin="${APP_BINS[$app]:-}"
+    info "Matched app profile: $app (method=$method)"
+  else
+    info "No app profile; using generalist debtap path"
+  fi
+
+  case "$method" in
+    extract-lm-studio)
+      install_lm_studio_extract "$deb"
+      ;;
+    debtap)
+      debtap_convert_and_install "$deb" "$pkgname" "$bin"
+      ;;
+    *)
+      die "unknown install method: $method"
+      ;;
+  esac
+}
+
+main
