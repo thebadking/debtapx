@@ -80,6 +80,7 @@ declare -A APP_GLOBS=(
   [lm-studio]="LM-Studio-*.deb"
   [lmstudio]="LM-Studio-*.deb"
   [opencode]="opencode*.deb"
+  [ladybird]="ladybird_*.deb"
   [autenticacao-gov]="plugin-autenticacao-gov*.deb"
   [plugin-autenticacao-gov]="plugin-autenticacao-gov*.deb"
 )
@@ -92,6 +93,7 @@ declare -A APP_METHODS=(
   [lm-studio]="extract-lm-studio"
   [lmstudio]="extract-lm-studio"
   [opencode]="debtap"
+  [ladybird]="debtap"
   [autenticacao-gov]="debtap"
   [plugin-autenticacao-gov]="debtap"
 )
@@ -104,11 +106,13 @@ declare -A APP_PKGNAMES=(
   [lm-studio]="lm-studio"
   [lmstudio]="lm-studio"
   [opencode]="opencode-desktop"
+  [ladybird]="ladybird"
   [autenticacao-gov]="plugin-autenticacao-gov"
   [plugin-autenticacao-gov]="plugin-autenticacao-gov"
 )
 
 declare -A APP_BINS=(
+  [ladybird]="ladybird"
   [grok-bot]="grok-bot"
   [grok]="grok-bot"
   [bitwig]="bitwig-studio"
@@ -196,6 +200,7 @@ detect_app_from_deb() {
     bitwig-studio*.deb|bitwig*.deb) echo bitwig-studio ;;
     LM-Studio-*.deb|lm-studio*.deb) echo lm-studio ;;
     opencode*.deb) echo opencode ;;
+    ladybird_*.deb) echo ladybird ;;
     plugin-autenticacao-gov*.deb) echo plugin-autenticacao-gov ;;
     *) echo "" ;;
   esac
@@ -224,6 +229,7 @@ ensure_debtap_ready() {
 # debtap sometimes emits Debian-ish deps that don't exist on Arch (e.g. bare "gtk").
 sanitize_arch_pkg() {
   local pkg="$1"
+  local pkgname_hint="${2:-}"
   local work fixed out
   work="$(mktemp -d)"
   # shellcheck disable=SC2064
@@ -235,8 +241,20 @@ sanitize_arch_pkg() {
   # Drop known-bad depends; keep gtk3/gtk4 etc.
   grep -Ev '^depend = (gtk|libgtk-3-0|libgtk2\.0-0|gconf2|gconf)$' \
     "$work/.PKGINFO" >"$work/.PKGINFO.fixed"
+  if [[ "$pkgname_hint" == ladybird ]]; then
+    # debtap maps Ubuntu's libatomic/libgcc/fonts and FFmpeg alternatives
+    # to unrelated packages. Declare the actual Arch runtime dependencies.
+    sed -i '/^depend = /d; /^optdepend = /d' "$work/.PKGINFO.fixed"
+    local dep
+    for dep in ttf-liberation libatomic 'glibc>=2.43' dbus libdrm libgcc \
+      glib2 libglvnd libpulse 'qt6-base>=6.10.2' 'qt6-positioning>=6.6' \
+      libstdc++ vulkan-icd-loader wayland xcb-util-wm libxcb libxkbcommon; do
+      printf 'depend = %s\n' "$dep" >>"$work/.PKGINFO.fixed"
+    done
+    printf 'optdepend = ffmpeg: media playback\n' >>"$work/.PKGINFO.fixed"
+  fi
   if ! cmp -s "$work/.PKGINFO" "$work/.PKGINFO.fixed"; then
-    info "Sanitizing Arch package metadata (removed non-Arch depends)"
+    info "Sanitizing Arch package metadata (corrected runtime dependencies)"
     mv "$work/.PKGINFO.fixed" "$work/.PKGINFO"
     # Invalidate bundled .MTREE so pacman regenerates integrity from contents
     rm -f "$work/.MTREE"
@@ -300,7 +318,7 @@ debtap_convert_and_install() {
   fi
 
   info "Created: $newest"
-  sanitize_arch_pkg "$newest"
+  sanitize_arch_pkg "$newest" "$pkgname_hint"
 
   if $CONVERT_ONLY; then
     info "Convert-only; skipping install."

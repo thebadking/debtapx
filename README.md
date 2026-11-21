@@ -39,6 +39,7 @@ debtapx --help
 debtapx                          # pick a .deb from ~/Downloads
 debtapx grok-bot                 # latest grok-bot_*.deb in ~/Downloads
 debtapx bitwig
+debtapx ladybird                 # latest ladybird_*.deb with Arch dependencies
 debtapx lm-studio                # extract installer (not debtap)
 debtapx /path/to/app.deb         # generalist path
 debtapx --convert-only app.deb   # convert only
@@ -53,6 +54,7 @@ debtapx --no-update app.deb      # skip debtap -u
 | `bitwig` / `bitwig-studio` | debtap | `bitwig-studio*.deb` |
 | `lm-studio` / `lmstudio` | extract to `/opt` | `LM-Studio-*.deb` |
 | `opencode` | debtap | `opencode*.deb` |
+| `ladybird` | debtap + runtime dependency fixes | `ladybird_*.deb` |
 | `autenticacao-gov` | debtap | `plugin-autenticacao-gov*.deb` |
 
 Unknown debs use the generalist debtap path.
